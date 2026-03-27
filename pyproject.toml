@@ -8,3 +8,8 @@ dependencies = [
     "aiohttp>=3.13.3",
     "loguru>=0.7.3",
 ]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
