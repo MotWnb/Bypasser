@@ -44,6 +44,32 @@ DOH_BACKENDS = [
     "https://doh.seby.io/dns-query"
 ]
 
+BACKEND_ALIAS = {
+    "https://1.1.1.1/dns-query": "cloudflare doh",
+    "https://1.0.0.1/dns-query": "cloudflare doh",
+    "https://1.1.1.3/dns-query": "cloudflare family",
+    "https://1.0.0.3/dns-query": "cloudflare family",
+    "https://8.8.8.8/dns-query": "google doh",
+    "https://8.8.4.4/dns-query": "google doh",
+    "https://223.5.5.5/dns-query": "aliyun doh",
+    "https://223.6.6.6/dns-query": "aliyun doh",
+    "https://101.101.101.101/dns-query": "twnic quad101",
+    "https://dns.twnic.tw/dns-query": "twnic quad101",
+    "https://v.recipes/dns-query": "v.recipes",
+    "https://185.222.222.222/dns-query": "dns.sb main",
+    "https://45.11.45.11/dns-query": "dns.sb main"
+}
+
+
+def alias_of(url):
+    if url in BACKEND_ALIAS:
+        return BACKEND_ALIAS[url]
+    if ".doh.sb" in url:
+        host = url.split("//")[1].split("/")[0]
+        return "dns.sb " + host.split(".")[0]
+    return ""
+
+
 CHECK_HOST = "steamcommunity.com"
 CHECK_TYPE_A = b"\x00\x01"
 AKAMAI_KEYWORD = "akamai"
@@ -134,7 +160,8 @@ class DohSelector:
         candidates.sort(key=lambda x: x[1])
         async with self.lock:
             self.current = candidates[0][0]
-        logger.info(f"backend {self.current} {int(candidates[0][1])}ms")
+        name = alias_of(self.current)
+        logger.info(f"backend {self.current} {name} {int(candidates[0][1])}ms")
 
     async def get_backend(self):
         async with self.lock:
