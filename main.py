@@ -22,6 +22,12 @@ DOH_BACKENDS = [
     "https://8.8.8.8/dns-query",
     "https://8.8.4.4/dns-query",
     "https://v.recipes/dns-query",
+    "https://v.recipes/dns-cn",
+    "https://v.recipes/dns/dns.google/dns-query", # https://v.recipes/dns/ THANKS
+    "https://v.recipes/dns/cloudflare-dns.com/dns-query",
+    "https://v.recipes/dns/doh.sb/dns-query",
+    "https://v.recipes/dns/dns.twnic.tw/dns-query",
+    "https://v.recipes/dns/doh.seby.io/dns-query",
     "https://185.222.222.222/dns-query",
     "https://45.11.45.11/dns-query",
     "https://de-dus.doh.sb/dns-query",
@@ -58,6 +64,7 @@ BACKEND_ALIAS = {
     "https://101.101.101.101/dns-query": "twnic quad101",
     "https://dns.twnic.tw/dns-query": "twnic quad101",
     "https://v.recipes/dns-query": "v.recipes",
+    "https://v.recipes/dns-cn": "v.recipes CN",
     "https://185.222.222.222/dns-query": "dns.sb main",
     "https://45.11.45.11/dns-query": "dns.sb main"
 }
