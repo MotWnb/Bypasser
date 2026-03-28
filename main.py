@@ -4,6 +4,8 @@ import time
 import socket
 import aiodns
 import aiohttp
+from aiohttp import TCPConnector
+from aiohttp.resolver import AsyncResolver
 
 logger.add("doh.log", rotation="5 MB", retention="7 days", compression="zip", enqueue=True)
 
@@ -60,7 +62,6 @@ BACKEND_ALIAS = {
     "https://45.11.45.11/dns-query": "dns.sb main"
 }
 
-
 def alias_of(url):
     if url in BACKEND_ALIAS:
         return BACKEND_ALIAS[url]
@@ -69,13 +70,12 @@ def alias_of(url):
         return "dns.sb " + host.split(".")[0]
     return ""
 
-
 CHECK_HOST = "steamcommunity.com"
 CHECK_TYPE_A = b"\x00\x01"
 AKAMAI_KEYWORD = "akamai"
 CHECK_TIMEOUT = 3
 REFRESH_INTERVAL = 60
-
+REFRESH_CONCURRENCY = 20
 
 class DohSelector:
     def __init__(self, backends):
@@ -83,6 +83,7 @@ class DohSelector:
         self.current = None
         self.lock = asyncio.Lock()
         self.resolver = aiodns.DNSResolver()
+        self.resolver.nameservers = ['223.5.5.5', '8.8.8.8']
 
     async def check_backend(self, session, url):
         tid = int(time.time() * 1000) & 0xFFFF
@@ -100,7 +101,7 @@ class DohSelector:
                         "content-type": "application/dns-message",
                         "accept": "application/dns-message",
                     },
-                    timeout=CHECK_TIMEOUT,
+                    timeout=aiohttp.ClientTimeout(total=CHECK_TIMEOUT),
             ) as r:
                 if r.status != 200:
                     logger.warning(f"{url} status {r.status}")
@@ -113,49 +114,79 @@ class DohSelector:
         if len(data) < 12:
             logger.warning(f"{url} response too short")
             return None
-        ancount = int.from_bytes(data[6:8], "big")
-        if ancount == 0:
-            logger.warning(f"{url} no dns answer")
-            return None
-        offset = 12
-        while data[offset] != 0:
-            offset += 1 + data[offset]
-        offset += 1 + 4
-        answers = []
-        for _ in range(ancount):
-            if data[offset] & 0xC0 == 0xC0:
+        try:
+            ancount = int.from_bytes(data[6:8], "big")
+            offset = 12
+            if offset >= len(data):
+                logger.warning(f"{url} response malformed")
+                return None
+            while offset < len(data) and data[offset] != 0:
+                step = data[offset]
+                offset += 1 + step
+            offset += 1 + 4
+            answers = []
+            for _ in range(ancount):
+                if offset >= len(data):
+                    break
+                if data[offset] & 0xC0 == 0xC0:
+                    offset += 2
+                else:
+                    while offset < len(data) and data[offset] != 0:
+                        step = data[offset]
+                        offset += 1 + step
+                    offset += 1
+                if offset + 10 > len(data):
+                    break
+                rtype = data[offset: offset + 2]
+                offset += 8
+                if offset + 2 > len(data):
+                    break
+                rdlength = int.from_bytes(data[offset: offset + 2], "big")
                 offset += 2
-            else:
-                while data[offset] != 0:
-                    offset += 1 + data[offset]
-                offset += 1
-            rtype = data[offset: offset + 2]
-            offset += 8
-            rdlength = int.from_bytes(data[offset: offset + 2], "big")
-            offset += 2
-            rdata = data[offset: offset + rdlength]
-            offset += rdlength
-            if rtype == CHECK_TYPE_A and rdlength == 4:
-                answers.append(socket.inet_ntoa(rdata))
+                if offset + rdlength > len(data):
+                    break
+                rdata = data[offset: offset + rdlength]
+                offset += rdlength
+                if rtype == CHECK_TYPE_A and rdlength == 4:
+                    answers.append(socket.inet_ntoa(rdata))
+        except Exception as e:
+            logger.warning(f"{url} parse fail {e}")
+            return None
         if not answers:
             logger.warning(f"{url} no valid A record")
             return None
+        valid = False
         for ip in answers:
             try:
                 ptr = await asyncio.wait_for(self.resolver.gethostbyaddr(ip), CHECK_TIMEOUT)
             except Exception:
                 logger.warning(f"{url} ptr resolve timeout/fail for {ip}")
-                return None
-            if AKAMAI_KEYWORD not in ptr.name.lower():
-                logger.warning(f"{url} reject {ip} ptr {ptr.name}")
-                return None
+                continue
+            try:
+                name = ptr.name if hasattr(ptr, "name") else str(ptr)
+            except Exception:
+                name = str(ptr)
+            if AKAMAI_KEYWORD in name.lower():
+                valid = True
+                break
+            else:
+                logger.warning(f"{url} reject {ip} ptr {name}")
+        if not valid:
+            logger.warning(f"{url} no akamai ptr")
+            return None
         logger.info(f"{url} ok {int(rtt)}ms")
         return rtt
 
     async def refresh(self):
-        logger.info("refresh start")
-        async with aiohttp.ClientSession() as session:
-            tasks = [self.check_backend(session, u) for u in self.backends]
+        resolver = AsyncResolver(nameservers=['223.5.5.5', '8.8.8.8'])
+        connector = TCPConnector(resolver=resolver, limit=REFRESH_CONCURRENCY)
+        timeout = aiohttp.ClientTimeout(total=CHECK_TIMEOUT)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=False) as session:
+            sem = asyncio.Semaphore(REFRESH_CONCURRENCY)
+            async def safe_check(u):
+                async with sem:
+                    return await self.check_backend(session, u)
+            tasks = [safe_check(u) for u in self.backends]
             results = await asyncio.gather(*tasks)
         candidates = [(u, r) for u, r in zip(self.backends, results) if r is not None]
         if not candidates:
@@ -174,18 +205,25 @@ class DohSelector:
     async def loop_refresh(self):
         await asyncio.sleep(REFRESH_INTERVAL)
         while True:
-            await self.refresh()
+            try:
+                await self.refresh()
+            except Exception:
+                logger.exception("refresh loop error")
             await asyncio.sleep(REFRESH_INTERVAL)
-
 
 class DohDNSProtocol(asyncio.DatagramProtocol):
     def __init__(self, selector):
         self.selector = selector
         self.transport = None
-        self.session = aiohttp.ClientSession()
+        self.session = None
+        self._closed = False
 
     def connection_made(self, transport):
         self.transport = transport
+        resolver = AsyncResolver(nameservers=['223.5.5.5', '8.8.8.8'])
+        connector = TCPConnector(resolver=resolver)
+        timeout = aiohttp.ClientTimeout(total=CHECK_TIMEOUT)
+        self.session = aiohttp.ClientSession(connector=connector, timeout=timeout, trust_env=False)
         logger.info("dns server start")
 
     def datagram_received(self, data, addr):
@@ -193,7 +231,7 @@ class DohDNSProtocol(asyncio.DatagramProtocol):
 
     async def handle_query(self, data, addr):
         backend = await self.selector.get_backend()
-        if not backend:
+        if not backend or self.session.closed:
             return
         try:
             async with self.session.post(
@@ -203,7 +241,7 @@ class DohDNSProtocol(asyncio.DatagramProtocol):
                         "content-type": "application/dns-message",
                         "accept": "application/dns-message",
                     },
-                    timeout=CHECK_TIMEOUT,
+                    timeout=aiohttp.ClientTimeout(total=CHECK_TIMEOUT),
             ) as r:
                 if r.status != 200:
                     return
@@ -211,12 +249,23 @@ class DohDNSProtocol(asyncio.DatagramProtocol):
         except Exception as e:
             logger.warning(f"query fail {e}")
             return
-        self.transport.sendto(resp, addr)
+        if self.transport is not None:
+            try:
+                self.transport.sendto(resp, addr)
+            except Exception:
+                logger.exception("sendto failed")
 
     def connection_lost(self, exc):
-        asyncio.create_task(self.session.close())
+        self._closed = True
         logger.info("dns server stop")
 
+    async def close(self):
+        if self.session is not None and not self.session.closed:
+            try:
+                await self.session.close()
+            except Exception:
+                logger.exception("error closing client session")
+        self._closed = True
 
 async def main():
     selector = DohSelector(DOH_BACKENDS)
@@ -229,10 +278,22 @@ async def main():
     refresher = asyncio.create_task(selector.loop_refresh())
     try:
         await asyncio.Future()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
     finally:
         refresher.cancel()
+        try:
+            await refresher
+        except asyncio.CancelledError:
+            pass
         transport.close()
-
+        try:
+            await protocol.close()
+        except Exception:
+            logger.exception("protocol close failed")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
