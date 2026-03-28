@@ -111,9 +111,11 @@ class DohSelector:
             return None
         rtt = (time.perf_counter() - start) * 1000
         if len(data) < 12:
+            logger.warning(f"{url} response too short")
             return None
         ancount = int.from_bytes(data[6:8], "big")
         if ancount == 0:
+            logger.warning(f"{url} no dns answer")
             return None
         offset = 12
         while data[offset] != 0:
@@ -136,11 +138,13 @@ class DohSelector:
             if rtype == CHECK_TYPE_A and rdlength == 4:
                 answers.append(socket.inet_ntoa(rdata))
         if not answers:
+            logger.warning(f"{url} no valid A record")
             return None
         for ip in answers:
             try:
                 ptr = await asyncio.wait_for(self.resolver.gethostbyaddr(ip), CHECK_TIMEOUT)
             except Exception:
+                logger.warning(f"{url} ptr resolve timeout/fail for {ip}")
                 return None
             if AKAMAI_KEYWORD not in ptr.name.lower():
                 logger.warning(f"{url} reject {ip} ptr {ptr.name}")
